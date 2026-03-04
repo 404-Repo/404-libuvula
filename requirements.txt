@@ -1,0 +1,4 @@
+trimesh==4.11.2
+loguru==0.7.3
+numpy==2.2.6
+pillow==12.1.1
