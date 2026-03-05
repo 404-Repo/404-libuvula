@@ -12,3 +12,5 @@ target_compile_definitions(pyUvula PRIVATE PYUVULA_VERSION="${PYUVULA_VERSION}")
 if (NOT MSVC AND NOT ${CMAKE_BUILD_TYPE} MATCHES Debug|RelWithDebInfo)
     pybind11_strip(pyUvula)
 endif ()
+
+install(TARGETS pyUvula DESTINATION ${PROJECT_SOURCE_DIR}/pyuvula)
