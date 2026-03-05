@@ -31,5 +31,10 @@ cmake .. \
     -DUVULA_ENABLE_EXTENSIVE_WARNINGS=OFF
 
 cmake --build . -- -j$(nproc)
+
+cd ..
+pip install build
+python -m build -w -o "./wheels"
+
 echo "✅ Uvula built successfully!"
 
