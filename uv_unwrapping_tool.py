@@ -11,7 +11,7 @@ from pyuvula import load_mesh, save_mesh
 def unwrap_with_uvula(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     t1 = time()
 
-    out_uvs, out_vertices, out_faces, _, _ = pyuvula.unwrap(np.array(mesh.vertices), np.array(mesh.faces))
+    out_uvs, out_vertices, out_faces, _, _, _ = pyuvula.unwrap(np.array(mesh.vertices), np.array(mesh.faces))
 
     t2 = time()
     print(f"libuvula: {(t2 - t1)} secs")
