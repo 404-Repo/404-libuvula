@@ -21,4 +21,5 @@ struct Point2F;
  * @param texture_height Output height to be used for the texture image
  * @return
  */
-bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::vector<Point2F>& uv_coords, uint32_t& texture_width, uint32_t& texture_height);
+bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::vector<Point2F>& uv_coords,
+                 uint32_t& texture_width, uint32_t& texture_height, std::vector<uint32_t>& vertex_remap);

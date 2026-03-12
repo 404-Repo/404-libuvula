@@ -6,6 +6,7 @@
 #include <cmath>
 #include <map>
 #include <numeric>
+#include <queue>
 #include <set>
 
 #include <range/v3/algorithm/partition.hpp>
@@ -35,7 +36,7 @@ struct FaceData
  */
 std::vector<Vector3F> calculateProjectionNormals(const std::vector<FaceData>& faces_data)
 {
-    constexpr float group_angle_limit = 45.0;
+    constexpr float group_angle_limit = 20.0;
 
     const float group_angle_limit_cos = std::cos(geometry_utils::deg2rad(group_angle_limit));
     const float group_angle_limit_half_cos = std::cos(geometry_utils::deg2rad(group_angle_limit / 2));
@@ -222,100 +223,93 @@ static std::vector<std::vector<size_t>> makeCharts(const std::vector<Point3F>& v
 }
 
 /*!
- * When projecting faces groups along a normal, it is possible that we project faces that are actually far away from each other spatially. This sometimes
- * results in overlapping projections, which we really want to avoid. The purpose of this function is to make sub-groups of faces groups for faces that are
- * adjacent to each other.
- * @param grouped_faces Contains the grouped indices of faces
- * @param faces The actual faces definitions, whose vertices should have been merged before, @sa groupSimilarVertices()
- * @return Grouped faces with groups containing only adjacent faces. It may be identical to the original groups, or contain more smaller groups
+ * Splits each normal-group into connected components using edge adjacency (BFS).
+ * Two faces are considered connected only if they share a full edge (two vertices),
+ * not merely a single vertex.  This avoids the problem where the old vertex-based
+ * connectivity merged distant faces that touched only at a corner.
+ * @param grouped_faces Contains the grouped indices of faces from makeCharts
+ * @param faces Position-merged faces for adjacency detection (@sa groupSimilarVertices)
+ * @return Grouped faces with groups containing only edge-connected faces
  */
 std::vector<std::vector<size_t>> splitNonLinkedFacesCharts(const std::vector<std::vector<size_t>>& grouped_faces, const std::vector<Face>& faces)
 {
     std::vector<std::vector<size_t>> result;
 
-    struct AssignedVertex
-    {
-        uint32_t index;
-        bool assigned;
-    };
-
     for (const std::vector<size_t>& faces_group : grouped_faces)
     {
-        size_t max_group_index = 0; // Incrementing group index
-
-        // Keep a double cache so that we can find very quickly the group of a vertex, and all the vertices from a group
-        std::map<size_t, size_t> new_indices_groups; // vertex_index: group_index
-        std::map<size_t, std::set<size_t>> new_groups_vertices; // group_index: [vertex_index]
-
-        for (const size_t face_index : faces_group)
+        if (faces_group.size() <= 1)
         {
-            const Face& face = faces[face_index];
-            std::set<size_t> assigned_groups;
-            std::array<AssignedVertex, 3> assigned_vertices = { AssignedVertex{ .index = face.i1 }, AssignedVertex{ .index = face.i2 }, AssignedVertex{ .index = face.i3 } };
-            for (AssignedVertex& assigned_vertex : assigned_vertices)
+            result.push_back(faces_group);
+            continue;
+        }
+
+        // Build local index: global face index -> local index within this group
+        std::map<size_t, size_t> global_to_local;
+        for (size_t i = 0; i < faces_group.size(); i++)
+            global_to_local[faces_group[i]] = i;
+
+        // Build edge -> local face list map
+        using Edge = std::pair<uint32_t, uint32_t>;
+        std::map<Edge, std::vector<size_t>> edge_locals;
+        for (size_t li = 0; li < faces_group.size(); li++)
+        {
+            const Face& f = faces[faces_group[li]];
+            const uint32_t v[3] = { f.i1, f.i2, f.i3 };
+            for (int e = 0; e < 3; e++)
             {
-                auto iterator = new_indices_groups.find(assigned_vertex.index);
-                assigned_vertex.assigned = iterator != new_indices_groups.end();
-                if (assigned_vertex.assigned)
+                uint32_t a = v[e], b = v[(e + 1) % 3];
+                if (a > b)
+                    std::swap(a, b);
+                edge_locals[{ a, b }].push_back(li);
+            }
+        }
+
+        // Build edge-based adjacency list (local indices)
+        std::vector<std::vector<size_t>> adj(faces_group.size());
+        for (const auto& [edge, locals] : edge_locals)
+            for (size_t i = 0; i < locals.size(); i++)
+                for (size_t j = i + 1; j < locals.size(); j++)
                 {
-                    assigned_groups.insert(iterator->second);
+                    adj[locals[i]].push_back(locals[j]);
+                    adj[locals[j]].push_back(locals[i]);
                 }
-            }
 
-            if (assigned_groups.empty())
+        // BFS to find connected components
+        std::vector<int> component(faces_group.size(), -1);
+        int n_components = 0;
+
+        for (size_t seed = 0; seed < faces_group.size(); seed++)
+        {
+            if (component[seed] != -1)
+                continue;
+
+            const int comp = n_components++;
+            std::queue<size_t> queue;
+            queue.push(seed);
+            component[seed] = comp;
+
+            while (! queue.empty())
             {
-                // None of the points are assigned yet, just assign them to a new group
-                const size_t new_group_index = max_group_index++;
-                new_indices_groups[face.i1] = new_group_index;
-                new_indices_groups[face.i2] = new_group_index;
-                new_indices_groups[face.i3] = new_group_index;
-                new_groups_vertices[new_group_index] = { face.i1, face.i2, face.i3 };
-            }
-            else
-            {
-                const size_t target_group = *assigned_groups.begin();
-                std::set<size_t>& target_group_vertices = new_groups_vertices[target_group];
-
-                std::set<size_t> source_groups = assigned_groups;
-                source_groups.erase(source_groups.begin());
-
-                // First assign vertices that are not assigned yet
-                for (const AssignedVertex& assigned_vertex : assigned_vertices)
+                const size_t curr = queue.front();
+                queue.pop();
+                for (const size_t neighbor : adj[curr])
                 {
-                    if (! assigned_vertex.assigned)
+                    if (component[neighbor] == -1)
                     {
-                        new_indices_groups[assigned_vertex.index] = target_group;
-                        target_group_vertices.insert(assigned_vertex.index);
+                        component[neighbor] = comp;
+                        queue.push(neighbor);
                     }
                 }
-
-                // Now merge source groups to the target group, including actually processed vertices
-                for (const size_t source_group : source_groups)
-                {
-                    auto it_source_group = new_groups_vertices.find(source_group);
-                    for (const size_t vertex_from_source_group : it_source_group->second)
-                    {
-                        size_t& vertex_group = new_indices_groups[vertex_from_source_group];
-                        vertex_group = target_group;
-                        target_group_vertices.insert(vertex_from_source_group);
-                    }
-
-                    new_groups_vertices.erase(it_source_group);
-                }
             }
         }
 
-        std::map<size_t, std::vector<size_t>> new_faces_groups; // group_index: [face_index]
-        for (const size_t face_index : faces_group)
-        {
-            const Face& face = faces[face_index];
-            new_faces_groups[new_indices_groups[face.i1]].push_back(face_index);
-        }
+        std::vector<std::vector<size_t>> components(n_components);
+        for (size_t li = 0; li < faces_group.size(); li++)
+            components[component[li]].push_back(faces_group[li]);
 
-        for (const std::vector<size_t>& faces_indices : new_faces_groups | ranges::views::values)
-        {
-            result.push_back(faces_indices);
-        }
+        for (auto& comp : components)
+            if (! comp.empty())
+                result.push_back(std::move(comp));
     }
 
     return result;
@@ -834,7 +828,8 @@ static void duplicateAndReproject(
     std::vector<Face>& faces,
     std::vector<Point2F>& uv_coords,
     const std::vector<Face>& original_faces,
-    const std::vector<std::vector<size_t>>& charts)
+    const std::vector<std::vector<size_t>>& charts,
+    std::vector<uint32_t>* out_vertex_remap = nullptr)
 {
     std::vector<uint32_t> vertex_owner(vertices.size(), UINT32_MAX);
     std::vector<uint32_t> vertex_remap(vertices.size());
@@ -927,7 +922,11 @@ static void duplicateAndReproject(
                 uv_coords[vi] = axis_mat.project(vertices[vertex_remap[vi]]);
             }
         }
+
     }
+
+    if (out_vertex_remap)
+        *out_vertex_remap = std::move(vertex_remap);
 }
 
 static void restorePreDuplicationState(
@@ -977,34 +976,27 @@ bool packCharts(
         return false;
     }
 
-    constexpr uint32_t resolution = 4096;
+    constexpr uint32_t calculation_definition = 512;
+    constexpr uint32_t desired_definition = 4096;
 
     xatlas::SetCharts(atlas, charts);
 
-    constexpr xatlas::PackOptions pack_options{ .padding = 1, .resolution = resolution };
+    constexpr xatlas::PackOptions pack_options{ .padding = 0, .resolution = calculation_definition };
     xatlas::PackCharts(atlas, pack_options);
-
-    if (atlas->meshCount == 0 || atlas->meshes == nullptr)
-    {
-        xatlas::Destroy(atlas);
-        return false;
-    }
 
     texture_width = atlas->width;
     texture_height = atlas->height;
-
-    for (auto& uv : uv_coords)
-        uv = Point2F{ .x = 0.0f, .y = 0.0f };
+    const uint32_t max_side = std::max(texture_width, texture_height);
+    const double scale = static_cast<double>(desired_definition) / static_cast<double>(max_side);
+    texture_width = std::llrint(texture_width * scale);
+    texture_height = std::llrint(texture_height * scale);
 
     const xatlas::Mesh& output_mesh = *atlas->meshes;
     const auto width = static_cast<float>(atlas->width);
     const auto height = static_cast<float>(atlas->height);
-
     for (size_t i = 0; i < output_mesh.vertexCount; ++i)
     {
         const xatlas::PlacedVertex& vertex = output_mesh.vertexArray[i];
-        if (vertex.chartIndex < 0)
-            continue;
         uv_coords[vertex.xref] = Point2F{ .x = vertex.uv[0] / width, .y = vertex.uv[1] / height };
     }
 
@@ -1012,7 +1004,8 @@ bool packCharts(
     return true;
 }
 
-bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::vector<Point2F>& uv_coords, uint32_t& texture_width, uint32_t& texture_height)
+bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::vector<Point2F>& uv_coords,
+                 uint32_t& texture_width, uint32_t& texture_height, std::vector<uint32_t>& vertex_remap)
 {
     const std::vector<Face> original_faces(faces);
     std::vector<std::vector<size_t>> charts = makeCharts(vertices, faces, uv_coords);
@@ -1032,10 +1025,11 @@ bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::
     // Iterative merge-split: each iteration merges aggressively then runs overlap
     // detection so that folded charts are split back.  Fragments from one iteration
     // become candidates for absorption into *different* neighbors in the next.
-    constexpr size_t merge_iters = 2;
+    constexpr size_t merge_iters = 3;
     const size_t merge_thresholds[merge_iters] = {
-        std::max<size_t>(original_faces.size() / 1000, 16),
-        std::max<size_t>(original_faces.size() / 4000, 8),
+        std::max<size_t>(original_faces.size() / 500, 32),
+        std::max<size_t>(original_faces.size() / 2000, 16),
+        std::max<size_t>(original_faces.size() / 8000, 4),
     };
 
     for (size_t iter = 0; iter < merge_iters; ++iter)
@@ -1049,7 +1043,52 @@ bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::
     }
 
     // Phase 4: Final vertex duplication and re-projection
-    duplicateAndReproject(vertices, faces, uv_coords, original_faces, charts);
+    duplicateAndReproject(vertices, faces, uv_coords, original_faces, charts, &vertex_remap);
 
-    return packCharts(vertices, faces, charts, uv_coords, texture_width, texture_height);
+    if (! packCharts(vertices, faces, charts, uv_coords, texture_width, texture_height))
+        return false;
+
+    // Strip degenerate faces (all 3 vertices at UV origin) and compact the vertex array.
+    {
+        const auto at_origin = [](const Point2F& p) { return p.x == 0.0f && p.y == 0.0f; };
+
+        std::vector<Face> clean_faces;
+        clean_faces.reserve(faces.size());
+        for (const Face& f : faces)
+        {
+            if (at_origin(uv_coords[f.i1]) && at_origin(uv_coords[f.i2]) && at_origin(uv_coords[f.i3]))
+                continue;
+            clean_faces.push_back(f);
+        }
+
+        std::vector<uint32_t> idx_remap(vertices.size(), UINT32_MAX);
+        std::vector<Point3F> compact_verts;
+        std::vector<Point2F> compact_uvs;
+        std::vector<uint32_t> compact_vremap;
+        compact_verts.reserve(clean_faces.size());
+        compact_uvs.reserve(clean_faces.size());
+        compact_vremap.reserve(clean_faces.size());
+
+        for (Face& f : clean_faces)
+        {
+            for (uint32_t* vi : { &f.i1, &f.i2, &f.i3 })
+            {
+                if (idx_remap[*vi] == UINT32_MAX)
+                {
+                    idx_remap[*vi] = static_cast<uint32_t>(compact_verts.size());
+                    compact_verts.push_back(vertices[*vi]);
+                    compact_uvs.push_back(uv_coords[*vi]);
+                    compact_vremap.push_back(vertex_remap[*vi]);
+                }
+                *vi = idx_remap[*vi];
+            }
+        }
+
+        vertices = std::move(compact_verts);
+        uv_coords = std::move(compact_uvs);
+        vertex_remap = std::move(compact_vremap);
+        faces = std::move(clean_faces);
+    }
+
+    return true;
 }

@@ -31,6 +31,7 @@ py::tuple pyUnwrap(const py::array_t<float>& vertices_array, const py::array_t<i
     auto indices = std::vector<Face>(indices_ptr, indices_ptr + indices_buf.shape[0]);
 
     std::vector<Point2F> uv_coords(vertices.size(), { 0.0, 0.0 });
+    std::vector<uint32_t> vertex_remap;
     uint32_t texture_width;
     uint32_t texture_height;
 
@@ -38,7 +39,7 @@ py::tuple pyUnwrap(const py::array_t<float>& vertices_array, const py::array_t<i
         py::gil_scoped_release release;
 
         // smartUnwrap may expand vertices/indices/uv_coords by duplicating boundary vertices
-        if (! smartUnwrap(vertices, indices, uv_coords, texture_width, texture_height))
+        if (! smartUnwrap(vertices, indices, uv_coords, texture_width, texture_height, vertex_remap))
         {
             throw std::runtime_error("Couldn't unwrap UV's!");
         }
@@ -57,7 +58,10 @@ py::tuple pyUnwrap(const py::array_t<float>& vertices_array, const py::array_t<i
     py::array_t<int32_t> out_indices({ n_faces, py::ssize_t(3) });
     std::memcpy(out_indices.mutable_data(), indices.data(), n_faces * sizeof(Face));
 
-    return py::make_tuple(out_uv, out_vertices, out_indices, texture_width, texture_height);
+    py::array_t<int32_t> out_vmap({ n_verts });
+    std::memcpy(out_vmap.mutable_data(), vertex_remap.data(), n_verts * sizeof(uint32_t));
+
+    return py::make_tuple(out_uv, out_vertices, out_indices, texture_width, texture_height, out_vmap);
 }
 
 py::list pyProject(
