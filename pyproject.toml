@@ -17,4 +17,4 @@ dependencies = [
 
 [tool.scikit-build]
 wheel.packages = ["pyuvula"]
-cmake.verbose = true
+build.verbose = true
