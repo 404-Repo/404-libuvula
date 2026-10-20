@@ -114,6 +114,8 @@ struct UvMeshDecl
 AddMeshError AddUvMesh(Atlas* atlas, const UvMeshDecl& decl);
 
 void SetCharts(Atlas* atlas, const std::vector<std::vector<size_t>>& grouped_faces);
+struct ChartLayoutHints; // defined below PackOptions
+void SetChartLayoutHints(Atlas* atlas, const ChartLayoutHints& hints);
 
 struct PackOptions
 {
@@ -147,6 +149,39 @@ struct PackOptions
 
     // Rotate charts to improve packing.
     bool rotateCharts = true;
+
+    // Enlarge charts so both extents are at least this many texels (0 = off): a chart whose
+    // triangles cover < 1 texel is never rasterised and its texels get filled from neighbours.
+    uint32_t minChartExtent = 0;
+
+    // Neighbour-aware placement (needs SetChartLayoutHints): ring search radius / stride, in texels.
+    uint32_t nearSearchRadius = 96;
+    uint32_t nearSearchStep = 2;
+    uint32_t nearSearchAttempts = 2048;
+
+    // Cluster packing (needs ChartLayoutHints::groupOfChart): charts of a group are packed inside
+    // their own groupCellSize x groupCellSize block, blocks are placed on a grid next to the blocks
+    // of neighbouring groups. 0 = off.
+    uint32_t groupCellSize = 0;
+
+    // Soft square: neighbour-aware placement first tries to stay inside a square sized for this
+    // fill fraction of the total chart footprint, growing outside it only when nothing fits.
+    float squareFillTarget = 0.72f;
+};
+
+// Placement hints (Pixal3D fork): an explicit chart placement order and the chart adjacency
+// graph (CSR, weights = shared boundary length). With hints, charts are placed in the given
+// order and each chart is searched for a spot next to its already placed neighbours, so
+// charts that touch on the surface end up adjacent in the atlas.
+struct ChartLayoutHints
+{
+    const uint32_t* order = nullptr; // chartCount entries
+    const uint32_t* nbOffsets = nullptr; // chartCount + 1 entries
+    const uint32_t* nbIds = nullptr;
+    const float* nbWeights = nullptr;
+    const uint32_t* groupOfChart = nullptr; // chartCount entries, UINT32_MAX = no group (packed as a free chart)
+    const uint32_t* groupBlockSize = nullptr; // chartCount entries: side of the group's block (power of two, texels)
+    uint32_t chartCount = 0;
 };
 
 // Call after ComputeCharts. Can be called multiple times to re-pack charts with different options.

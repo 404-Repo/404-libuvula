@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "pyuvula"
-version = "0.0.0"
+version = "0.1.0"
 description = "UV unwrapping pipeline with pybind11 bindings and preprocessing utilities"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,4 +17,4 @@ dependencies = [
 
 [tool.scikit-build]
 wheel.packages = ["pyuvula"]
-cmake.verbose = true
+build.verbose = true

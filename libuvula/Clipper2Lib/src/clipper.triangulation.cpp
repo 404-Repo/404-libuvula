@@ -174,7 +174,6 @@ namespace Clipper2Lib
 
   static double GetLocMinAngle(Vertex2* v)
   {
-    // todo - recheck the result's sign compared to left vs right turning
     // (currently assumes left turning => positive values)
     // precondition - this function is called before processing locMin.
     //Assert(v->edges.size() == 2);
@@ -692,7 +691,6 @@ namespace Clipper2Lib
     int64_t yBest = vBest->pt.y;
 
     // make sure no edges intersect 'vAbove' and 'vBest' ...
-    // todo: fActives is currently *unsorted* but consider making it
     // a tree structure based on each edge's left and right bounds
     e = firstActive;
     if (xBest < xAbove)
