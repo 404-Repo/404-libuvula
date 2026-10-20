@@ -1,9 +1,9 @@
-## 404-libuvula-fork
+## 404 LibUVula
 
-This library is a fork of the [Uvula](https://github.com/Ultimaker/libUvula?tab=LGPL-3.0-1-ov-file) library developped by Ultimaker company.
-It is a UV-unwrapping package that works fast for small meshes as well as for quite big ones (over 1 000 000 faces).
-It provides grouped and non-overlapping patches of projected faces on a texture.
-This implementation slightly differs from the original one. 
+This library is a fork of the [LibUVula](https://github.com/Ultimaker/libUvula?tab=LGPL-3.0-1-ov-file) library developed by **Ultimaker** company.
+This version is optimized for quick uv unwrapping of the meshes of any polygon size.
+It provides grouped and non-overlapping patches of projected uvs that enables accurate
+texture inpainting.
 
 ### 🛠️ Hardware Requirements:
 This project can be run on any machine as it does not rely on GPU.
@@ -12,15 +12,19 @@ This project can be run on any machine as it does not rely on GPU.
 You will only need pre-installed **mini-conda3**. The provided script will install all essential packages afterwards.
 
 ### 🚀 How to install / uninstall project:
-- Install the project using bash script "setup_env.sh" (tt will also build python wheels for the current project):
+- Install the project conda environment using bash script "setup_env.sh":
 ```console
 bash setup_env.sh
 ```
-- Uninstall project using the bash script "cleanup_env.sh":
+- Uninstall project conda environment using the bash script "cleanup_env.sh":
 ```console
 bash cleanup_env.sh
 ```
-The wheel file will be generated in "wheel" folder.
+- Build wheel file for the project:
+```console
+bash build.sh
+```
+*.whl file will be generated in "wheels" folder.
 
 ### 🚀 How to run project:
 The python bindings expose the following function:
@@ -46,6 +50,7 @@ To use this function in python just do the following:
 ```python
 from pathlib import Path
 
+import numpy as np
 import pyuvula
 from pyuvula import load_mesh, assemble_textured_mesh
 
@@ -71,4 +76,4 @@ And here there is an example of uv-unwrapped high polygonal robot head.
 
 ### ⚖️ License
 
-This model and code are released under the **[GNU LGPL License](LICENSE)** that allows for commercial use.
+This forked vresion of the uvula is released under the **[GNU LGPL License](LICENSE)** that allows for commercial use.
