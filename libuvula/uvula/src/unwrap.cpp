@@ -2,12 +2,20 @@
 
 #include "unwrap.h"
 
+#include "charting.h"
+
+#include <chrono>
+
 #include <algorithm>
+#include <atomic>
+#include <future>
 #include <cmath>
 #include <map>
+#include <limits>
 #include <numeric>
 #include <queue>
 #include <set>
+#include <unordered_map>
 
 #include <range/v3/algorithm/partition.hpp>
 #include <range/v3/view/enumerate.hpp>
@@ -45,6 +53,8 @@ std::vector<Vector3F> calculateProjectionNormals(const std::vector<FaceData>& fa
     const Vector3F* project_normal = &faces_data.front().normal;
 
     std::vector<Vector3F> projection_normals;
+    std::vector<float> best_angles(faces_data.size(), std::numeric_limits<float>::lowest());
+    size_t previous_normal_count = 0;
 
     // Create an internal list containing pointers to all the faces data, it will be reorganized
     std::vector<const FaceData*> faces_to_process(faces_data.size());
@@ -103,10 +113,12 @@ std::vector<Vector3F> calculateProjectionNormals(const std::vector<FaceData>& fa
 
         for (auto iterator = unprocessed_faces.begin; iterator != unprocessed_faces.end; ++iterator)
         {
-            float face_best_angle = std::numeric_limits<float>::lowest();
-            for (const Vector3F& projection_normal : projection_normals)
+            // Existing normals and face normals are immutable; extend their
+            // previous maximum in exactly the original comparison order.
+            float& face_best_angle = best_angles[*iterator - faces_data.data()];
+            for (size_t i = previous_normal_count; i < projection_normals.size(); ++i)
             {
-                face_best_angle = std::max(face_best_angle, projection_normal.dot((*iterator)->normal));
+                face_best_angle = std::max(face_best_angle, projection_normals[i].dot((*iterator)->normal));
             }
 
             if (face_best_angle < best_outlier_angle)
@@ -115,6 +127,8 @@ std::vector<Vector3F> calculateProjectionNormals(const std::vector<FaceData>& fa
                 best_outlier_face = iterator;
             }
         }
+
+        previous_normal_count = projection_normals.size();
 
         if (best_outlier_angle < group_angle_limit_cos)
         {
@@ -243,73 +257,43 @@ std::vector<std::vector<size_t>> splitNonLinkedFacesCharts(const std::vector<std
             continue;
         }
 
-        // Build local index: global face index -> local index within this group
-        std::map<size_t, size_t> global_to_local;
-        for (size_t i = 0; i < faces_group.size(); i++)
-            global_to_local[faces_group[i]] = i;
-
-        // Build edge -> local face list map
-        using Edge = std::pair<uint32_t, uint32_t>;
-        std::map<Edge, std::vector<size_t>> edge_locals;
-        for (size_t li = 0; li < faces_group.size(); li++)
-        {
-            const Face& f = faces[faces_group[li]];
-            const uint32_t v[3] = { f.i1, f.i2, f.i3 };
-            for (int e = 0; e < 3; e++)
+        // Connectivity alone determines each component. Union edge neighbors
+        // without constructing every pair in an adjacency list. Choosing the
+        // smallest local root preserves the original BFS seed/component order.
+        std::vector<size_t> parent(faces_group.size());
+        std::iota(parent.begin(), parent.end(), 0);
+        const auto find_root = [&](size_t i) {
+            while (parent[i] != i)
             {
-                uint32_t a = v[e], b = v[(e + 1) % 3];
-                if (a > b)
-                    std::swap(a, b);
-                edge_locals[{ a, b }].push_back(li);
+                parent[i] = parent[parent[i]];
+                i = parent[i];
             }
-        }
-
-        // Build edge-based adjacency list (local indices)
-        std::vector<std::vector<size_t>> adj(faces_group.size());
-        for (const auto& [edge, locals] : edge_locals)
-            for (size_t i = 0; i < locals.size(); i++)
-                for (size_t j = i + 1; j < locals.size(); j++)
-                {
-                    adj[locals[i]].push_back(locals[j]);
-                    adj[locals[j]].push_back(locals[i]);
-                }
-
-        // BFS to find connected components
-        std::vector<int> component(faces_group.size(), -1);
-        int n_components = 0;
-
-        for (size_t seed = 0; seed < faces_group.size(); seed++)
+            return i;
+        };
+        std::unordered_map<uint64_t, size_t> edge_first;
+        edge_first.reserve(faces_group.size() * 2);
+        for (size_t li = 0; li < faces_group.size(); ++li)
         {
-            if (component[seed] != -1)
-                continue;
-
-            const int comp = n_components++;
-            std::queue<size_t> queue;
-            queue.push(seed);
-            component[seed] = comp;
-
-            while (! queue.empty())
+            const Face& face = faces[faces_group[li]];
+            const uint32_t v[3] = { face.i1, face.i2, face.i3 };
+            for (int e = 0; e < 3; ++e)
             {
-                const size_t curr = queue.front();
-                queue.pop();
-                for (const size_t neighbor : adj[curr])
+                const uint32_t a = std::min(v[e], v[(e + 1) % 3]);
+                const uint32_t b = std::max(v[e], v[(e + 1) % 3]);
+                const uint64_t key = (uint64_t(a) << 32) | uint64_t(b);
+                const auto [entry, inserted] = edge_first.emplace(key, li);
+                if (!inserted)
                 {
-                    if (component[neighbor] == -1)
-                    {
-                        component[neighbor] = comp;
-                        queue.push(neighbor);
-                    }
+                    const size_t x = find_root(li), y = find_root(entry->second);
+                    parent[std::max(x, y)] = std::min(x, y);
                 }
             }
         }
-
-        std::vector<std::vector<size_t>> components(n_components);
-        for (size_t li = 0; li < faces_group.size(); li++)
-            components[component[li]].push_back(faces_group[li]);
-
-        for (auto& comp : components)
-            if (! comp.empty())
-                result.push_back(std::move(comp));
+        std::map<size_t, std::vector<size_t>> components;
+        for (size_t li = 0; li < faces_group.size(); ++li)
+            components[find_root(li)].push_back(faces_group[li]);
+        for (auto& [root, component] : components)
+            result.push_back(std::move(component));
     }
 
     return result;
@@ -366,12 +350,15 @@ static std::vector<std::vector<size_t>> splitSelfOverlappingCharts(
     constexpr int GRID_CELLS = GRID_RES * GRID_RES;
     std::vector<std::vector<size_t>> result;
 
-    for (const auto& chart : charts)
+    std::vector<std::vector<std::vector<size_t>>> per_chart(charts.size());
+    auto process_chart = [&](size_t chart_index)
     {
+        const auto& chart = charts[chart_index];
+        auto& result = per_chart[chart_index];
         if (chart.size() <= 2)
         {
             result.push_back(chart);
-            continue;
+            return;
         }
 
         float umin = std::numeric_limits<float>::max(), umax = std::numeric_limits<float>::lowest();
@@ -392,7 +379,7 @@ static std::vector<std::vector<size_t>> splitSelfOverlappingCharts(
         if (du < 1e-10f || dv < 1e-10f)
         {
             result.push_back(chart);
-            continue;
+            return;
         }
 
         const float scale_u = static_cast<float>(GRID_RES) / du;
@@ -482,7 +469,7 @@ static std::vector<std::vector<size_t>> splitSelfOverlappingCharts(
         if (! overlap_found)
         {
             result.push_back(chart);
-            continue;
+            return;
         }
 
         // BFS layering: greedily assign faces to non-overlapping layers while preserving connectivity.
@@ -556,7 +543,24 @@ static std::vector<std::vector<size_t>> splitSelfOverlappingCharts(
         for (auto& layer : layers)
             if (! layer.empty())
                 result.push_back(std::move(layer));
-    }
+    };
+
+    // Charts have disjoint local state. Retain their original output ordering.
+    const size_t worker_count = std::min<size_t>(16, charts.size());
+    std::atomic<size_t> next_chart{0};
+    std::vector<std::future<void>> workers;
+    for (size_t worker = 0; worker < worker_count; ++worker)
+        workers.push_back(std::async(std::launch::async, [&] {
+            while (true) {
+                const size_t index = next_chart.fetch_add(1, std::memory_order_relaxed);
+                if (index >= charts.size()) return;
+                process_chart(index);
+            }
+        }));
+    for (auto& worker : workers) worker.get();
+    for (auto& group : per_chart)
+        for (auto& chart : group)
+            result.push_back(std::move(chart));
 
     return result;
 }
@@ -692,6 +696,7 @@ static std::vector<std::vector<size_t>> splitElongatedCharts(
  * vertices with, provided their average normals are compatible. Uses union-find for clean cycle handling.
  * @param charts Current face groups
  * @param connectivity_faces Faces with position-merged vertex indices for adjacency detection
+ * @param vertex_faces Face adjacency for the unchanged connectivity indices
  * @param original_faces Original faces for normal computation
  * @param vertices Vertex positions for normal computation
  * @param min_chart_size Charts with fewer faces than this are candidates for merging
@@ -699,6 +704,7 @@ static std::vector<std::vector<size_t>> splitElongatedCharts(
 static std::vector<std::vector<size_t>> mergeTinyCharts(
     const std::vector<std::vector<size_t>>& charts,
     const std::vector<Face>& connectivity_faces,
+    const std::vector<std::vector<size_t>>& vertex_faces,
     const std::vector<Face>& original_faces,
     const std::vector<Point3F>& vertices,
     size_t min_chart_size)
@@ -726,14 +732,6 @@ static std::vector<std::vector<size_t>> mergeTinyCharts(
     for (size_t ci = 0; ci < charts.size(); ci++)
         for (const size_t fi : charts[ci])
             face_chart[fi] = ci;
-
-    std::map<uint32_t, std::vector<size_t>> vertex_faces;
-    for (size_t fi = 0; fi < connectivity_faces.size(); fi++)
-    {
-        vertex_faces[connectivity_faces[fi].i1].push_back(fi);
-        vertex_faces[connectivity_faces[fi].i2].push_back(fi);
-        vertex_faces[connectivity_faces[fi].i3].push_back(fi);
-    }
 
     std::vector<size_t> parent(charts.size());
     std::iota(parent.begin(), parent.end(), size_t(0));
@@ -763,12 +761,16 @@ static std::vector<std::vector<size_t>> mergeTinyCharts(
         group_size[a] += group_size[b];
     };
 
+    // Reuse dense counts instead of allocating a tree for each tiny chart.
+    // Sort only touched roots to retain the original map's merge tie-breaking.
+    std::vector<size_t> neighbor_counts(charts.size(), 0);
+    std::vector<size_t> neighbors;
     for (size_t ci = 0; ci < charts.size(); ci++)
     {
         if (charts[ci].size() >= min_chart_size)
             continue;
 
-        std::map<size_t, size_t> neighbor_shared;
+        neighbors.clear();
         for (const size_t fi : charts[ci])
         {
             for (const uint32_t vi : { connectivity_faces[fi].i1, connectivity_faces[fi].i2, connectivity_faces[fi].i3 })
@@ -777,18 +779,25 @@ static std::vector<std::vector<size_t>> mergeTinyCharts(
                 {
                     const size_t nci = face_chart[nfi];
                     if (nci != SIZE_MAX && find(nci) != find(ci))
-                        neighbor_shared[find(nci)]++;
+                    {
+                        const size_t root = find(nci);
+                        if (neighbor_counts[root]++ == 0)
+                            neighbors.push_back(root);
+                    }
                 }
             }
         }
 
-        if (neighbor_shared.empty())
+        if (neighbors.empty())
             continue;
+        std::sort(neighbors.begin(), neighbors.end());
 
         size_t best_neighbor = find(ci);
         size_t best_count = 0;
-        for (const auto& [nci, count] : neighbor_shared)
+        for (const size_t nci : neighbors)
         {
+            const size_t count = neighbor_counts[nci];
+            neighbor_counts[nci] = 0;
             if (chart_normals[ci].dot(chart_normals[nci]) < min_normal_alignment)
                 continue;
 
@@ -829,12 +838,16 @@ static void duplicateAndReproject(
     std::vector<Point2F>& uv_coords,
     const std::vector<Face>& original_faces,
     const std::vector<std::vector<size_t>>& charts,
-    std::vector<uint32_t>* out_vertex_remap = nullptr)
+    std::vector<uint32_t>* out_vertex_remap = nullptr,
+    const std::vector<Vector3F>* chart_normals = nullptr)
 {
     std::vector<uint32_t> vertex_owner(vertices.size(), UINT32_MAX);
     std::vector<uint32_t> vertex_remap(vertices.size());
     std::iota(vertex_remap.begin(), vertex_remap.end(), 0u);
-    std::map<std::pair<uint32_t, uint32_t>, uint32_t> dup_map;
+    // Charts are processed in order, so only the current chart's duplicate for
+    // each source vertex can be requested again. Keep the original creation order.
+    std::vector<uint32_t> duplicate_chart(vertices.size(), UINT32_MAX);
+    std::vector<uint32_t> duplicate_index(vertices.size(), UINT32_MAX);
 
     std::vector<bool> face_in_chart(faces.size(), false);
 
@@ -855,11 +868,9 @@ static void duplicateAndReproject(
                 }
                 else
                 {
-                    auto key = std::make_pair(*vi, chart_idx);
-                    auto it = dup_map.find(key);
-                    if (it != dup_map.end())
+                    if (duplicate_chart[*vi] == chart_idx)
                     {
-                        *vi = it->second;
+                        *vi = duplicate_index[*vi];
                     }
                     else
                     {
@@ -868,7 +879,10 @@ static void duplicateAndReproject(
                         vertices.push_back(vertices[*vi]);
                         vertex_owner.push_back(chart_idx);
                         vertex_remap.push_back(*vi);
-                        dup_map[key] = new_idx;
+                        duplicate_chart[*vi] = chart_idx;
+                        duplicate_index[*vi] = new_idx;
+                        duplicate_chart.push_back(UINT32_MAX);
+                        duplicate_index.push_back(UINT32_MAX);
                         *vi = new_idx;
                     }
                 }
@@ -901,16 +915,24 @@ static void duplicateAndReproject(
     for (uint32_t chart_idx = 0; chart_idx < static_cast<uint32_t>(charts.size()); ++chart_idx)
     {
         Vector3F avg_normal;
-        for (const size_t face_idx : charts[chart_idx])
+        if (chart_normals)
         {
-            const Face& orig_face = original_faces[face_idx];
-            const auto tri_normal = geometry_utils::triangleNormal(
-                vertices[orig_face.i1], vertices[orig_face.i2], vertices[orig_face.i3]);
-            if (tri_normal.has_value())
-                avg_normal += tri_normal.value();
+            // Projection direction chosen by the charter (every face is inside its cone)
+            avg_normal = (*chart_normals)[chart_idx];
         }
-        if (! avg_normal.normalize())
-            continue;
+        else
+        {
+            for (const size_t face_idx : charts[chart_idx])
+            {
+                const Face& orig_face = original_faces[face_idx];
+                const auto tri_normal = geometry_utils::triangleNormal(
+                    vertices[orig_face.i1], vertices[orig_face.i2], vertices[orig_face.i3]);
+                if (tri_normal.has_value())
+                    avg_normal += tri_normal.value();
+            }
+            if (! avg_normal.normalize())
+                continue;
+        }
 
         const Matrix33F axis_mat = Matrix33F::makeOrthogonalBasis(avg_normal);
 
@@ -958,7 +980,9 @@ bool packCharts(
     const std::vector<std::vector<size_t>>& charts,
     std::vector<Point2F>& uv_coords,
     uint32_t& texture_width,
-    uint32_t& texture_height)
+    uint32_t& texture_height,
+    const UnwrapOptions& options,
+    const MeshTopology* topo = nullptr)
 {
     xatlas::Atlas* atlas = xatlas::Create();
     xatlas::UvMeshDecl mesh;
@@ -976,36 +1000,223 @@ bool packCharts(
         return false;
     }
 
-    constexpr uint32_t calculation_definition = 512;
-    constexpr uint32_t desired_definition = 4096;
+    const uint32_t calculation_definition = options.pack_resolution;
+    const uint32_t desired_definition = options.texture_size;
 
     xatlas::SetCharts(atlas, charts);
 
-    constexpr xatlas::PackOptions pack_options{ .padding = 0, .resolution = calculation_definition };
-    xatlas::PackCharts(atlas, pack_options);
+    xatlas::PackOptions pack_options{ .padding = options.padding, .resolution = calculation_definition };
+    // Footprint guarantee: min_island_texels at the final texture, expressed in packing-grid texels
+    pack_options.nearSearchRadius = options.near_radius;
+    pack_options.nearSearchStep = options.near_step;
+    pack_options.nearSearchAttempts = options.near_attempts;
+    pack_options.minChartExtent = static_cast<uint32_t>(std::ceil(static_cast<double>(options.min_island_texels) * calculation_definition / std::max<uint32_t>(desired_definition, 1)));
 
-    texture_width = atlas->width;
-    texture_height = atlas->height;
-    const uint32_t max_side = std::max(texture_width, texture_height);
-    const double scale = static_cast<double>(desired_definition) / static_cast<double>(max_side);
-    texture_width = std::llrint(texture_width * scale);
-    texture_height = std::llrint(texture_height * scale);
+    // Neighbour-aware placement: chart adjacency (shared 3D boundary length) and a placement order
+    // that keeps neighbours consecutive (Prim-like: next = chart most connected to the placed set).
+    std::vector<uint32_t> order, nb_offsets, nb_ids;
+    std::vector<float> nb_weights;
+    if (options.proximity_packing && topo != nullptr && ! charts.empty())
+    {
+        const size_t C = charts.size();
+        std::vector<uint32_t> face_chart(topo->adj.size(), UINT32_MAX);
+        for (size_t c = 0; c < C; ++c)
+            for (const size_t f : charts[c])
+                face_chart[f] = static_cast<uint32_t>(c);
+        std::unordered_map<uint64_t, float> shared;
+        for (size_t c = 0; c < C; ++c)
+            for (const size_t f : charts[c])
+                for (int s = 0; s < 3; ++s)
+                {
+                    const int32_t nb = s == 0 ? topo->adj[f].i1 : (s == 1 ? topo->adj[f].i2 : topo->adj[f].i3);
+                    if (nb < 0)
+                        continue;
+                    const uint32_t cb = face_chart[nb];
+                    if (cb == UINT32_MAX || cb == c)
+                        continue;
+                    shared[(static_cast<uint64_t>(c) << 32) | cb] += topo->edge_len[3 * f + s];
+                }
+        std::vector<uint32_t> degree(C, 0);
+        for (const auto& [key, w] : shared)
+            ++degree[key >> 32];
+        nb_offsets.assign(C + 1, 0);
+        for (size_t c = 0; c < C; ++c)
+            nb_offsets[c + 1] = nb_offsets[c] + degree[c];
+        nb_ids.assign(nb_offsets[C], 0);
+        nb_weights.assign(nb_offsets[C], 0.0f);
+        std::vector<uint32_t> fill(nb_offsets.begin(), nb_offsets.end() - 1);
+        for (const auto& [key, w] : shared)
+        {
+            const uint32_t a = static_cast<uint32_t>(key >> 32);
+            nb_ids[fill[a]] = static_cast<uint32_t>(key & 0xffffffffu);
+            nb_weights[fill[a]] = w;
+            ++fill[a];
+        }
+        std::vector<float> key_w(C, 0.0f);
+        std::vector<uint8_t> visited(C, 0);
+        std::vector<uint32_t> by_size(C);
+        std::iota(by_size.begin(), by_size.end(), 0u);
+        std::sort(by_size.begin(), by_size.end(), [&charts](const uint32_t a, const uint32_t b) { return charts[a].size() > charts[b].size(); });
+        size_t next_seed = 0;
+        std::priority_queue<std::pair<float, uint32_t>> heap;
+        order.reserve(C);
+        while (order.size() < C)
+        {
+            if (heap.empty())
+            {
+                while (next_seed < C && visited[by_size[next_seed]])
+                    ++next_seed;
+                heap.emplace(std::numeric_limits<float>::max(), by_size[next_seed]);
+            }
+            const auto [k, c] = heap.top();
+            heap.pop();
+            if (visited[c])
+                continue;
+            visited[c] = 1;
+            order.push_back(c);
+            for (uint32_t i = nb_offsets[c]; i < nb_offsets[c + 1]; ++i)
+            {
+                const uint32_t n = nb_ids[i];
+                if (visited[n])
+                    continue;
+                key_w[n] += nb_weights[i];
+                heap.emplace(key_w[n], n);
+            }
+        }
+        // Cluster packing: 3D-connected groups of small charts, each packed inside one atlas block that
+        // is (about) one pyramid tile of the texture fill, so gutters inside a block are filled from
+        // charts of the same surface region.
+        std::vector<uint32_t> group_of_chart, block_sizes;
+        if (options.group_cell_texels > 0)
+        {
+            const uint32_t S = std::max<uint32_t>(8, static_cast<uint32_t>(std::llround(static_cast<double>(options.group_cell_texels) * calculation_definition / std::max<uint32_t>(desired_definition, 1))));
+            pack_options.groupCellSize = S;
+            // xatlas texel scale estimate (same formula it uses: 75% utilisation of the pack resolution)
+            double mesh_area = 0.0;
+            for (const Face& f : faces)
+            {
+                const Point2F &a = uv_coords[f.i1], &b = uv_coords[f.i2], &d = uv_coords[f.i3];
+                mesh_area += 0.5 * std::abs((b.x - a.x) * (d.y - a.y) - (d.x - a.x) * (b.y - a.y));
+            }
+            const double tpu = std::sqrt(static_cast<double>(calculation_definition) * calculation_definition / std::max(mesh_area / 0.75, 1e-12));
+            std::vector<double> chart_area(C, 0.0);
+            std::vector<uint8_t> big(C, 0);
+            for (size_t c = 0; c < C; ++c)
+            {
+                float umin = std::numeric_limits<float>::max(), umax = std::numeric_limits<float>::lowest(), vmin = umin, vmax = umax;
+                for (const size_t fi : charts[c])
+                    for (const uint32_t vi : { faces[fi].i1, faces[fi].i2, faces[fi].i3 })
+                    {
+                        umin = std::min(umin, uv_coords[vi].x); umax = std::max(umax, uv_coords[vi].x);
+                        vmin = std::min(vmin, uv_coords[vi].y); vmax = std::max(vmax, uv_coords[vi].y);
+                    }
+                const double w = (umax - umin) * tpu + 2.0, h = (vmax - vmin) * tpu + 2.0;
+                chart_area[c] = w * h;
+                big[c] = (w > 0.9 * S || h > 0.9 * S) ? 1 : 0;
+            }
+            // Kruskal on the chart adjacency (strongest boundaries first) with an area cap per group
+            std::vector<uint32_t> parent(C);
+            std::iota(parent.begin(), parent.end(), 0u);
+            const auto find = [&parent](uint32_t v) { while (parent[v] != v) { parent[v] = parent[parent[v]]; v = parent[v]; } return v; };
+            struct Edge { float w; uint32_t a, b; };
+            std::vector<Edge> edges;
+            edges.reserve(nb_ids.size() / 2);
+            for (uint32_t a = 0; a < C; ++a)
+                for (uint32_t i = nb_offsets[a]; i < nb_offsets[a + 1]; ++i)
+                    if (nb_ids[i] > a)
+                        edges.push_back(Edge{ nb_weights[i], a, nb_ids[i] });
+            std::sort(edges.begin(), edges.end(), [](const Edge& x, const Edge& y) { return x.w > y.w; });
+            const double cap = 0.7 * static_cast<double>(S) * S;
+            for (const Edge& e : edges)
+            {
+                if (big[e.a] || big[e.b])
+                    continue;
+                const uint32_t ra = find(e.a), rb = find(e.b);
+                if (ra == rb || chart_area[ra] + chart_area[rb] > cap)
+                    continue;
+                parent[rb] = ra;
+                chart_area[ra] += chart_area[rb];
+            }
+            group_of_chart.assign(C, UINT32_MAX);
+            std::vector<uint32_t> root_id(C, UINT32_MAX);
+            uint32_t groups = 0;
+            for (uint32_t c = 0; c < C; ++c)
+            {
+                if (big[c])
+                    continue;
+                const uint32_t r = find(c);
+                if (root_id[r] == UINT32_MAX)
+                    root_id[r] = groups++;
+                group_of_chart[c] = root_id[r];
+            }
+            // Block size per group: the smallest power of two whose 70%-filled area holds the group
+            std::vector<double> group_area(groups, 0.0);
+            for (uint32_t c = 0; c < C; ++c)
+                if (group_of_chart[c] != UINT32_MAX)
+                    group_area[group_of_chart[c]] += chart_area[c];
+            std::vector<uint32_t> block_of_chart(C, 0);
+            for (uint32_t c = 0; c < C; ++c)
+            {
+                if (group_of_chart[c] == UINT32_MAX)
+                    continue;
+                const double need = std::sqrt(group_area[group_of_chart[c]] / 0.8);
+                uint32_t side = static_cast<uint32_t>(std::ceil(need / 8.0)) * 8;
+                block_of_chart[c] = std::clamp<uint32_t>(side, 8, S);
+            }
+            // Keep every group's charts consecutive in the placement order (groups appear in Prim order)
+            std::vector<std::vector<uint32_t>> members(groups);
+            for (const uint32_t c : order)
+                if (group_of_chart[c] != UINT32_MAX)
+                    members[group_of_chart[c]].push_back(c);
+            // Big charts first, largest first: they dominate the area and would fragment the block grid
+            // if interleaved; the groups then attach around them in Prim order.
+            std::vector<uint32_t> grouped_order;
+            grouped_order.reserve(C);
+            for (const uint32_t c : by_size)
+                if (group_of_chart[c] == UINT32_MAX)
+                    grouped_order.push_back(c);
+            std::vector<uint8_t> emitted(groups, 0);
+            for (const uint32_t c : order)
+            {
+                const uint32_t g = group_of_chart[c];
+                if (g != UINT32_MAX && ! emitted[g])
+                {
+                    emitted[g] = 1;
+                    grouped_order.insert(grouped_order.end(), members[g].begin(), members[g].end());
+                }
+            }
+            order.swap(grouped_order);
+            block_sizes.swap(block_of_chart);
+            spdlog::debug("uvula pack: {} groups of small charts ({} big charts), blocks 8..{} pack texels", groups, std::count(big.begin(), big.end(), 1), S);
+        }
+        const xatlas::ChartLayoutHints hints{ order.data(), nb_offsets.data(), nb_ids.data(), nb_weights.data(), group_of_chart.empty() ? nullptr : group_of_chart.data(), block_sizes.empty() ? nullptr : block_sizes.data(), static_cast<uint32_t>(C) };
+        xatlas::SetChartLayoutHints(atlas, hints);
+    }
+    xatlas::PackCharts(atlas, pack_options);
+    if (atlas->utilization)
+        spdlog::debug("uvula pack: utilization {:.3f}", atlas->utilization[0]);
+
+    // The texture is always square downstream: normalise both axes by the same side so a
+    // non-square packed bitmap is not stretched anisotropically (the unused strip stays empty).
+    const uint32_t max_side = std::max(atlas->width, atlas->height);
+    texture_width = desired_definition;
+    texture_height = desired_definition;
+    spdlog::debug("uvula pack: bitmap {}x{} at resolution {} -> texture {}", atlas->width, atlas->height, calculation_definition, desired_definition);
 
     const xatlas::Mesh& output_mesh = *atlas->meshes;
-    const auto width = static_cast<float>(atlas->width);
-    const auto height = static_cast<float>(atlas->height);
+    const auto side = static_cast<float>(max_side);
     for (size_t i = 0; i < output_mesh.vertexCount; ++i)
     {
         const xatlas::PlacedVertex& vertex = output_mesh.vertexArray[i];
-        uv_coords[vertex.xref] = Point2F{ .x = vertex.uv[0] / width, .y = vertex.uv[1] / height };
+        uv_coords[vertex.xref] = Point2F{ .x = vertex.uv[0] / side, .y = vertex.uv[1] / side };
     }
 
     xatlas::Destroy(atlas);
     return true;
 }
 
-bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::vector<Point2F>& uv_coords,
-                 uint32_t& texture_width, uint32_t& texture_height, std::vector<uint32_t>& vertex_remap)
+static bool smartUnwrapLegacy(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::vector<Point2F>& uv_coords,
+                 uint32_t& texture_width, uint32_t& texture_height, std::vector<uint32_t>& vertex_remap, const UnwrapOptions& options)
 {
     const std::vector<Face> original_faces(faces);
     std::vector<std::vector<size_t>> charts = makeCharts(vertices, faces, uv_coords);
@@ -1032,9 +1243,20 @@ bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::
         std::max<size_t>(original_faces.size() / 8000, 4),
     };
 
+    // Connectivity stays fixed across merge passes. Dense lookup preserves the
+    // face insertion order used for neighbor counts and merge tie-breaking.
+    std::vector<std::vector<size_t>> vertex_faces(original_vertex_count);
+    for (size_t fi = 0; fi < faces_with_similar_indices.size(); ++fi)
+    {
+        const Face& face = faces_with_similar_indices[fi];
+        vertex_faces[face.i1].push_back(fi);
+        vertex_faces[face.i2].push_back(fi);
+        vertex_faces[face.i3].push_back(fi);
+    }
+
     for (size_t iter = 0; iter < merge_iters; ++iter)
     {
-        charts = mergeTinyCharts(charts, faces_with_similar_indices, original_faces, vertices, merge_thresholds[iter]);
+        charts = mergeTinyCharts(charts, faces_with_similar_indices, vertex_faces, original_faces, vertices, merge_thresholds[iter]);
 
         duplicateAndReproject(vertices, faces, uv_coords, original_faces, charts);
         charts = splitSelfOverlappingCharts(charts, faces, uv_coords);
@@ -1045,7 +1267,7 @@ bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::
     // Phase 4: Final vertex duplication and re-projection
     duplicateAndReproject(vertices, faces, uv_coords, original_faces, charts, &vertex_remap);
 
-    if (! packCharts(vertices, faces, charts, uv_coords, texture_width, texture_height))
+    if (! packCharts(vertices, faces, charts, uv_coords, texture_width, texture_height, options))
         return false;
 
     // Strip degenerate faces (all 3 vertices at UV origin) and compact the vertex array.
@@ -1090,5 +1312,86 @@ bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::
         faces = std::move(clean_faces);
     }
 
+    return true;
+}
+
+namespace
+{
+
+struct StageTimer
+{
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    double lap()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const double s = std::chrono::duration<double>(now - t).count();
+        t = now;
+        return s;
+    }
+};
+
+std::vector<Vector3F> chartNormalsFromFaces(const std::vector<std::vector<size_t>>& charts, const std::vector<Vector3F>& face_proj)
+{
+    std::vector<Vector3F> normals(charts.size());
+    for (size_t c = 0; c < charts.size(); ++c)
+        normals[c] = face_proj[charts[c].front()];
+    return normals;
+}
+
+} // namespace
+
+bool smartUnwrap(std::vector<Point3F>& vertices, std::vector<Face>& faces, std::vector<Point2F>& uv_coords, uint32_t& texture_width, uint32_t& texture_height, std::vector<uint32_t>& vertex_remap, const UnwrapOptions& options)
+{
+    if (options.legacy_charting)
+        return smartUnwrapLegacy(vertices, faces, uv_coords, texture_width, texture_height, vertex_remap, options);
+
+    StageTimer timer;
+    const size_t face_count = faces.size();
+    const MeshTopology topo = buildTopology(vertices, faces);
+    const double t_topology = timer.lap();
+
+    Charting charting = growCharts(topo, options);
+    std::vector<std::vector<size_t>> charts = chartLists(charting);
+    std::vector<Vector3F> chart_normals = charting.chart_normal;
+    reconnectCharts(charts, chart_normals, topo);
+    const double t_charting = timer.lap();
+
+    // Every face keeps the projection normal of the chart it was grown in, so pieces produced
+    // by later splits are still projected along a direction that bounds their stretch.
+    std::vector<Vector3F> face_proj(face_count);
+    for (size_t c = 0; c < charts.size(); ++c)
+        for (const size_t f : charts[c])
+            face_proj[f] = chart_normals[c];
+
+    const std::vector<Face> original_faces = faces;
+    const size_t original_vertex_count = vertices.size();
+
+    // Fold-free self-overlaps (helices, S-curves seen along the normal) are still possible: split them
+    duplicateAndReproject(vertices, faces, uv_coords, original_faces, charts, nullptr, &chart_normals);
+    const size_t charts_before_split = charts.size();
+    charts = splitSelfOverlappingCharts(charts, faces, uv_coords);
+    restorePreDuplicationState(vertices, uv_coords, faces, original_faces, original_vertex_count);
+    chart_normals = chartNormalsFromFaces(charts, face_proj);
+    reconnectCharts(charts, chart_normals, topo);
+    const double t_split = timer.lap();
+
+    duplicateAndReproject(vertices, faces, uv_coords, original_faces, charts, &vertex_remap, &chart_normals);
+    size_t charted = 0;
+    for (const auto& chart : charts)
+        charted += chart.size();
+    if (charted != face_count)
+        spdlog::error("uvula: {} of {} faces charted", charted, face_count);
+
+    if (! packCharts(vertices, faces, charts, uv_coords, texture_width, texture_height, options, &topo))
+        return false;
+    const double t_pack = timer.lap();
+
+    size_t tiny = 0;
+    for (const auto& chart : charts)
+        if (chart.size() <= 2)
+            ++tiny;
+    spdlog::info(
+        "uvula: {} charts ({} with <=2 faces, {} before overlap split) for {} faces | topology {:.2f}s charting {:.2f}s split {:.2f}s pack {:.2f}s",
+        charts.size(), tiny, charts_before_split, face_count, t_topology, t_charting, t_split, t_pack);
     return true;
 }

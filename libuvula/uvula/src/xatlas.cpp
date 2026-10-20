@@ -1,3 +1,4 @@
+#include <algorithm>
 /*
 MIT License
 
@@ -34,6 +35,8 @@ MIT License
 Copyright (c) 2012 Brandon Pelfrey
 */
 #include "xatlas.h"
+
+#include <spdlog/spdlog.h>
 #ifndef XATLAS_C_API
 #define XATLAS_C_API 0
 #endif
@@ -43,7 +46,8 @@ Copyright (c) 2012 Brandon Pelfrey
 #include <assert.h>
 #include <atomic>
 #include <condition_variable>
-#include <float.h> // FLT_MAX
+#include <float.h>
+#include <climits> // FLT_MAX
 #include <limits.h>
 #include <math.h>
 #include <mutex>
@@ -1003,6 +1007,14 @@ public:
         m_rowStride = rowStride;
     }
 
+    uint32_t countBits() const
+    {
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < m_rowStride * m_height; i++)
+            n += (uint32_t)__builtin_popcountll(m_data[i]);
+        return n;
+    }
+
     bool get(uint32_t x, uint32_t y) const
     {
         XA_DEBUG_ASSERT(x < m_width && y < m_height);
@@ -1687,7 +1699,7 @@ public:
     {
         m_threadIndex = 0;
         // Max with current task scheduler usage is 1 per thread + 1 deep nesting, but allow for some slop.
-        m_maxGroups = std::thread::hardware_concurrency() * 4;
+        m_maxGroups = std::min(16u, std::thread::hardware_concurrency()) * 4;
         m_groups = XA_ALLOC_ARRAY(TaskGroup, m_maxGroups);
         for (uint32_t i = 0; i < m_maxGroups; i++)
         {
@@ -1696,7 +1708,7 @@ public:
             m_groups[i].ref = 0;
             m_groups[i].userData = nullptr;
         }
-        m_workers.resize(std::thread::hardware_concurrency() <= 1 ? 1 : std::thread::hardware_concurrency() - 1);
+        m_workers.resize(std::min(16u, std::thread::hardware_concurrency()) <= 1 ? 1 : std::min(16u, std::thread::hardware_concurrency()) - 1);
         for (uint32_t i = 0; i < m_workers.size(); i++)
         {
             new (&m_workers[i]) Worker();
@@ -1727,7 +1739,7 @@ public:
 
     uint32_t threadCount() const
     {
-        return max(1u, std::thread::hardware_concurrency()); // Including the main thread.
+        return max(1u, std::min(16u, std::thread::hardware_concurrency())); // Including the main thread.
     }
 
     // userData is passed to Task::func as groupUserData.
@@ -1955,7 +1967,7 @@ public:
     ThreadLocal()
     {
 #if XA_MULTITHREADED
-        const uint32_t n = std::thread::hardware_concurrency();
+        const uint32_t n = std::min(16u, std::thread::hardware_concurrency());
 #else
         const uint32_t n = 1;
 #endif
@@ -1967,7 +1979,7 @@ public:
     ~ThreadLocal()
     {
 #if XA_MULTITHREADED
-        const uint32_t n = std::thread::hardware_concurrency();
+        const uint32_t n = std::min(16u, std::thread::hardware_concurrency());
 #else
         const uint32_t n = 1;
 #endif
@@ -2779,6 +2791,9 @@ struct Chart
     const Array<uint32_t>* boundaryEdges;
     // UvMeshChart only
     Array<uint32_t> faces;
+    // Placement result (for neighbour-aware layout)
+    bool placed = false;
+    float placedX = 0.0f, placedY = 0.0f;
 
     Vector2& uniqueVertexAt(uint32_t v)
     {
@@ -2904,6 +2919,37 @@ struct Atlas
     }
 
     // Pack charts in the smallest possible rectangle.
+    void setLayoutHints(const ChartLayoutHints& hints)
+    {
+        m_order.clear();
+        m_nbOffsets.clear();
+        m_nbIds.clear();
+        m_nbWeights.clear();
+        m_groups.clear();
+        m_blockSize.clear();
+        if (! hints.order || hints.chartCount != m_charts.size())
+            return;
+        for (uint32_t i = 0; i < hints.chartCount; i++)
+            m_order.push_back(hints.order[i]);
+        if (hints.groupOfChart)
+            for (uint32_t i = 0; i < hints.chartCount; i++)
+                m_groups.push_back(hints.groupOfChart[i]);
+        if (hints.groupBlockSize)
+            for (uint32_t i = 0; i < hints.chartCount; i++)
+                m_blockSize.push_back(hints.groupBlockSize[i]);
+        if (hints.nbOffsets && hints.nbIds && hints.nbWeights)
+        {
+            for (uint32_t i = 0; i <= hints.chartCount; i++)
+                m_nbOffsets.push_back(hints.nbOffsets[i]);
+            const uint32_t n = hints.nbOffsets[hints.chartCount];
+            for (uint32_t i = 0; i < n; i++)
+            {
+                m_nbIds.push_back(hints.nbIds[i]);
+                m_nbWeights.push_back(hints.nbWeights[i]);
+            }
+        }
+    }
+
     bool packCharts(const PackOptions& options)
     {
         const uint32_t chartCount = m_charts.size();
@@ -2993,6 +3039,11 @@ struct Atlas
                 int height = ftoi_ceil(extents.y);
                 if (options.blockAlign)
                     height = align(height + blockAlignSizeOffset, 4) - blockAlignSizeOffset;
+                if (options.minChartExtent > 0)
+                {
+                    width = max(width, (int)options.minChartExtent);
+                    height = max(height, (int)options.minChartExtent);
+                }
                 for (uint32_t v = 0; v < chart->uniqueVertexCount(); v++)
                 {
                     Vector2& texcoord = chart->uniqueVertexAt(v);
@@ -3060,24 +3111,11 @@ struct Atlas
         UniformGrid2 boundaryEdgeGrid;
         Array<Vector2i> atlasSizes;
         atlasSizes.push_back(Vector2i(0, 0));
-        int progress = 0;
-        for (uint32_t i = 0; i < chartCount; i++)
+        // Rasterises chart c into the scratch images and selects the image to pack (used by the
+        // coverage pre-pass and by the placement loop).
+        auto prepareChart = [&](uint32_t c, BitImage*& chartImageToPack, BitImage*& chartImageToPackRotated)
         {
-            uint32_t c = ranks[chartCount - i - 1]; // largest chart first
             Chart* chart = m_charts[c];
-            // @@ Add special cases for dot and line charts. @@ Lightmap rasterizer also needs to handle these special cases.
-            // @@ We could also have a special case for chart quads. If the quad surface <= 4 texels, align vertices with texel centers and do not add padding. May be very useful
-            // for foliage.
-            // @@ In general we could reduce the padding of all charts by one texel by using a rasterizer that takes into account the 2-texel footprint of the tent bilinear filter.
-            // For example, if we have a chart that is less than 1 texel wide currently we add one texel to the left and one texel to the right creating a 3-texel-wide bitImage.
-            // However, if we know that the chart is only 1 texel wide we could align it so that it only touches the footprint of two texels:
-            //      |   |      <- Touches texels 0, 1 and 2.
-            //    |   |        <- Only touches texels 0 and 1.
-            // \   \ / \ /   /
-            //  \   X   X   /
-            //   \ / \ / \ /
-            //    V   V   V
-            //    0   1   2
             // Resize and clear (discard = true) chart images.
             // Leave room for padding at extents.
             chartImage.resize(ftoi_ceil(chartExtents[c].x) + options.padding, ftoi_ceil(chartExtents[c].y) + options.padding, true);
@@ -3123,18 +3161,6 @@ struct Atlas
                 }
             }
             // Update brute force bucketing.
-            if (options.bruteForce)
-            {
-                if (chartOrderArray[c] > minChartPerimeter && chartOrderArray[c] <= maxChartPerimeter - (chartPerimeterBucketSize * (currentChartBucket + 1)))
-                {
-                    // Moved to a smaller bucket, reset start location.
-                    for (uint32_t j = 0; j < chartStartPositions.size(); j++)
-                        chartStartPositions[j] = Vector2i(0, 0);
-                    currentChartBucket++;
-                }
-            }
-            // Find a location to place the chart in the atlas.
-            BitImage *chartImageToPack, *chartImageToPackRotated;
             if (options.padding > 0)
             {
                 chartImageToPack = &chartImagePadding;
@@ -3150,10 +3176,271 @@ struct Atlas
                 chartImageToPack = &chartImage;
                 chartImageToPackRotated = &chartImageRotated;
             }
+        };
+        // Pre-pass (hinted placement only): rasterise every chart once, keep the images for the
+        // placement loop, measure the real coverage for the soft square and per-group block sizes.
+        int preferredSide = INT_MAX;
+        Array<BitImage*> keptImages, keptImagesRotated;
+        Array<uint32_t> chartCoverage;
+        if (m_order.size() == chartCount)
+        {
+            keptImages.resize(chartCount);
+            keptImagesRotated.resize(chartCount);
+            chartCoverage.resize(chartCount);
+            double coveredTexels = 0.0;
+            for (uint32_t c = 0; c < chartCount; c++)
+            {
+                BitImage *img, *imgRotated;
+                prepareChart(c, img, imgRotated);
+                keptImages[c] = XA_NEW(BitImage);
+                img->copyTo(*keptImages[c]);
+                keptImagesRotated[c] = nullptr;
+                if (options.rotateCharts)
+                {
+                    keptImagesRotated[c] = XA_NEW(BitImage);
+                    imgRotated->copyTo(*keptImagesRotated[c]);
+                }
+                chartCoverage[c] = img->countBits();
+                coveredTexels += (double)chartCoverage[c];
+            }
+            preferredSide = (int)ceilf(sqrtf((float)(coveredTexels / max(options.squareFillTarget, 0.05f))) / 64.0f) * 64;
+        }
+        int progress = 0;
+        // Cluster packing state: one block per group, allocated when its first chart is placed.
+        const bool useGroups = m_order.size() == chartCount && options.groupCellSize > 0 && m_groups.size() == chartCount;
+        uint32_t groupCount = 0;
+        if (useGroups)
+            for (uint32_t i = 0; i < chartCount; i++)
+                if (m_groups[i] != UINT32_MAX)
+                    groupCount = max(groupCount, m_groups[i] + 1);
+        Array<int> blockX, blockY;
+        blockX.resize(groupCount);
+        blockY.resize(groupCount);
+        for (uint32_t i = 0; i < groupCount; i++)
+            blockX[i] = blockY[i] = -1;
+        Array<uint32_t> groupOffsets, groupMembers;
+        if (useGroups)
+        {
+            groupOffsets.resize(groupCount + 1);
+            for (uint32_t i = 0; i <= groupCount; i++)
+                groupOffsets[i] = 0;
+            for (uint32_t i = 0; i < chartCount; i++)
+                if (m_groups[i] != UINT32_MAX)
+                    groupOffsets[m_groups[i] + 1]++;
+            for (uint32_t i = 0; i < groupCount; i++)
+                groupOffsets[i + 1] += groupOffsets[i];
+            groupMembers.resize(groupOffsets[groupCount]);
+            Array<uint32_t> fill;
+            fill.resize(groupCount);
+            for (uint32_t i = 0; i < groupCount; i++)
+                fill[i] = groupOffsets[i];
+            for (uint32_t i = 0; i < chartCount; i++)
+                if (m_groups[i] != UINT32_MAX)
+                    groupMembers[fill[m_groups[i]]++] = i;
+        }
+        // Solid test images per block size (blocks are power-of-two sized, aligned to their own grid)
+        BitImage* solidBlocks[16] = {};
+        auto solidBlockOf = [&](uint32_t size) -> const BitImage&
+        {
+            uint32_t k = 0;
+            while ((1u << k) < size)
+                k++;
+            if (! solidBlocks[k])
+            {
+                solidBlocks[k] = XA_NEW_ARGS(BitImage, size, size);
+                for (uint32_t y = 0; y < size; y++)
+                    for (uint32_t x = 0; x < size; x++)
+                        solidBlocks[k]->set(x, y);
+            }
+            return *solidBlocks[k];
+        };
+        if (useGroups && m_bitImages.isEmpty())
+            m_bitImages.push_back(XA_NEW_ARGS(BitImage, resolution, resolution));
+        Array<uint32_t> groupBlockSide;
+        if (useGroups)
+        {
+            groupBlockSide.resize(groupCount);
+            Array<double> groupCover;
+            groupCover.resize(groupCount);
+            for (uint32_t g = 0; g < groupCount; g++)
+                groupCover[g] = 0.0;
+            for (uint32_t c = 0; c < chartCount; c++)
+                if (m_groups[c] != UINT32_MAX)
+                    groupCover[m_groups[c]] += (double)chartCoverage[c];
+            for (uint32_t g = 0; g < groupCount; g++)
+            {
+                const int side = (int)ceil(sqrt(groupCover[g] / 0.8) / 8.0) * 8;
+                groupBlockSide[g] = (uint32_t)max(8, min((int)options.groupCellSize, side));
+            }
+        }
+        uint32_t blocksAllocated = 0, blockSpills = 0;
+        for (uint32_t i = 0; i < chartCount; i++)
+        {
+            const bool useOrder = m_order.size() == chartCount;
+            uint32_t c = useOrder ? m_order[i] : ranks[chartCount - i - 1]; // hinted order, else largest chart first
+            Chart* chart = m_charts[c];
+            // @@ Add special cases for dot and line charts. @@ Lightmap rasterizer also needs to handle these special cases.
+            // @@ We could also have a special case for chart quads. If the quad surface <= 4 texels, align vertices with texel centers and do not add padding. May be very useful
+            // for foliage.
+            // @@ In general we could reduce the padding of all charts by one texel by using a rasterizer that takes into account the 2-texel footprint of the tent bilinear filter.
+            // For example, if we have a chart that is less than 1 texel wide currently we add one texel to the left and one texel to the right creating a 3-texel-wide bitImage.
+            // However, if we know that the chart is only 1 texel wide we could align it so that it only touches the footprint of two texels:
+            //      |   |      <- Touches texels 0, 1 and 2.
+            //    |   |        <- Only touches texels 0 and 1.
+            // \   \ / \ /   /
+            //  \   X   X   /
+            //   \ / \ / \ /
+            //    V   V   V
+            //    0   1   2
+            if (options.bruteForce)
+            {
+                if (chartOrderArray[c] > minChartPerimeter && chartOrderArray[c] <= maxChartPerimeter - (chartPerimeterBucketSize * (currentChartBucket + 1)))
+                {
+                    // Moved to a smaller bucket, reset start location.
+                    for (uint32_t j = 0; j < chartStartPositions.size(); j++)
+                        chartStartPositions[j] = Vector2i(0, 0);
+                    currentChartBucket++;
+                }
+            }
+            // Find a location to place the chart in the atlas.
+            BitImage *chartImageToPack, *chartImageToPackRotated;
+            if (! keptImages.isEmpty())
+            {
+                chartImageToPack = keptImages[c];
+                chartImageToPackRotated = keptImagesRotated[c];
+            }
+            else
+                prepareChart(c, chartImageToPack, chartImageToPackRotated);
             uint32_t currentAtlas = 0;
             int best_x = 0, best_y = 0;
             int best_cw = 0, best_ch = 0;
             int best_r = 0;
+            // Neighbour-aware placement: aim at the weighted centre of the already placed neighbours.
+            bool placedNear = false;
+            bool haveOverride = false;
+            float overrideX = 0.0f, overrideY = 0.0f;
+            if (useGroups && m_groups[c] != UINT32_MAX && m_nbOffsets.size() == chartCount + 1)
+            {
+                const uint32_t g = m_groups[c];
+                const int S = (int)groupBlockSide[g];
+                if (blockX[g] < 0)
+                {
+                    // Allocate the group's block: the free S x S grid cell on the nearest ring around the
+                    // placed neighbours of the whole group, choosing within a ring the cell that least
+                    // extends the atlas (keeps the layout compact and square).
+                    float tx = 0.0f, ty = 0.0f, tw = 0.0f;
+                    for (uint32_t mi = groupOffsets[g]; mi < groupOffsets[g + 1]; mi++)
+                    {
+                        const uint32_t mc = groupMembers[mi];
+                        for (uint32_t k = m_nbOffsets[mc]; k < m_nbOffsets[mc + 1]; k++)
+                        {
+                            const Chart* n = m_charts[m_nbIds[k]];
+                            if (! n->placed)
+                                continue;
+                            tx += n->placedX * m_nbWeights[k];
+                            ty += n->placedY * m_nbWeights[k];
+                            tw += m_nbWeights[k];
+                        }
+                    }
+                    const int bx0 = tw > 0.0f ? (int)floorf(tx / tw / (float)S) : 0;
+                    const int by0 = tw > 0.0f ? (int)floorf(ty / tw / (float)S) : 0;
+                    const int aw = atlasSizes[0].x, ah = atlasSizes[0].y;
+                    for (int pass = 0; pass < 2 && blockX[g] < 0; pass++)
+                    for (int rad = 0; rad <= 64 && blockX[g] < 0; rad++)
+                    {
+                        long long bestMetric = LLONG_MAX;
+                        for (int dy = -rad; dy <= rad; dy++)
+                        {
+                            for (int dx = -rad; dx <= rad; dx++)
+                            {
+                                if (max(abs(dx), abs(dy)) != rad)
+                                    continue;
+                                const int bx = bx0 + dx, by = by0 + dy;
+                                if (bx < 0 || by < 0)
+                                    continue;
+                                if (maxResolution > 0 && ((bx + 1) * S > (int)maxResolution || (by + 1) * S > (int)maxResolution))
+                                    continue;
+                                if (pass == 0 && ((bx + 1) * S > preferredSide || (by + 1) * S > preferredSide))
+                                    continue;
+                                const long long ex = max(aw, (bx + 1) * S), ey = max(ah, (by + 1) * S);
+                                const long long extents = max(ex, ey);
+                                const long long metric = extents * extents + ex * ey;
+                                if (metric >= bestMetric)
+                                    continue;
+                                if (m_bitImages[0]->canBlit(solidBlockOf((uint32_t)S), (uint32_t)(bx * S), (uint32_t)(by * S)))
+                                {
+                                    bestMetric = metric;
+                                    blockX[g] = bx * S;
+                                    blockY[g] = by * S;
+                                }
+                            }
+                        }
+                        if (blockX[g] >= 0)
+                            blocksAllocated++;
+                    }
+                }
+                if (blockX[g] >= 0)
+                {
+                    // First fit inside the block (raster order), unrotated first
+                    const int rotations = options.rotateCharts ? 2 : 1;
+                    for (int r = 0; r < rotations && ! placedNear; r++)
+                    {
+                        int cw = (int)chartImageToPack->width(), ch = (int)chartImageToPack->height();
+                        if (r == 1)
+                            swap(cw, ch);
+                        if (cw > S || ch > S)
+                            continue;
+                        const BitImage& image = r == 1 ? *chartImageToPackRotated : *chartImageToPack;
+                        for (int y = blockY[g]; y <= blockY[g] + S - ch && ! placedNear; y++)
+                            for (int x = blockX[g]; x <= blockX[g] + S - cw; x++)
+                                if (m_bitImages[0]->canBlit(image, (uint32_t)x, (uint32_t)y))
+                                {
+                                    best_x = x;
+                                    best_y = y;
+                                    best_cw = cw;
+                                    best_ch = ch;
+                                    best_r = options.rotateCharts ? r : 0;
+                                    placedNear = true;
+                                    break;
+                                }
+                    }
+                    if (! placedNear)
+                    {
+                        // Block full: spill next to it
+                        haveOverride = true;
+                        overrideX = (float)blockX[g] + (float)S * 0.5f;
+                        overrideY = (float)blockY[g] + (float)S * 0.5f;
+                        blockSpills++;
+                    }
+                }
+            }
+            if (! placedNear && useOrder && m_nbOffsets.size() == chartCount + 1 && ! m_bitImages.isEmpty())
+            {
+                float tx = 0.0f, ty = 0.0f, tw = 0.0f;
+                if (haveOverride)
+                {
+                    tx = overrideX;
+                    ty = overrideY;
+                    tw = 1.0f;
+                }
+                else
+                    for (uint32_t k = m_nbOffsets[c]; k < m_nbOffsets[c + 1]; k++)
+                    {
+                        const Chart* n = m_charts[m_nbIds[k]];
+                        if (! n->placed)
+                            continue;
+                        tx += n->placedX * m_nbWeights[k];
+                        ty += n->placedY * m_nbWeights[k];
+                        tw += m_nbWeights[k];
+                    }
+                if (tw > 0.0f)
+                {
+                    placedNear = findChartLocation_near(options, m_bitImages[0], chartImageToPack, chartImageToPackRotated, atlasSizes[0].x, atlasSizes[0].y, tx / tw, ty / tw, &best_x, &best_y, &best_cw, &best_ch, &best_r, maxResolution, preferredSide);
+                    if (! placedNear)
+                        placedNear = findChartLocation_near(options, m_bitImages[0], chartImageToPack, chartImageToPackRotated, atlasSizes[0].x, atlasSizes[0].y, tx / tw, ty / tw, &best_x, &best_y, &best_cw, &best_ch, &best_r, maxResolution, INT_MAX);
+                }
+            }
+            if (! placedNear)
             for (;;)
             {
 #if XA_DEBUG
@@ -3232,6 +3519,9 @@ struct Atlas
             }
             addChart(m_bitImages[currentAtlas], chartImageToPack, chartImageToPackRotated, atlasSizes[currentAtlas].x, atlasSizes[currentAtlas].y, best_x, best_y, best_r);
             chart->atlasIndex = (int32_t)currentAtlas;
+            chart->placed = true;
+            chart->placedX = (float)best_x + (float)best_cw * 0.5f;
+            chart->placedY = (float)best_y + (float)best_ch * 0.5f;
             // Modify texture coordinates:
             //  - rotate if the chart should be rotated
             //  - translate to chart location
@@ -3251,6 +3541,29 @@ struct Atlas
                 texcoord.y -= (float)options.padding;
                 XA_ASSERT(texcoord.x >= 0 && texcoord.y >= 0);
                 XA_ASSERT(isFinite(texcoord.x) && isFinite(texcoord.y));
+            }
+        }
+        if (useGroups)
+            spdlog::debug("xatlas pack: {} groups, {} blocks allocated, {} spills, soft square {}", groupCount, blocksAllocated, blockSpills, preferredSide);
+        else if (m_order.size() == chartCount)
+            spdlog::debug("xatlas pack: hinted order, soft square {}", preferredSide);
+        for (BitImage* bi : solidBlocks)
+            if (bi)
+            {
+                bi->~BitImage();
+                XA_FREE(bi);
+            }
+        for (uint32_t c = 0; c < keptImages.size(); c++)
+        {
+            if (keptImages[c])
+            {
+                keptImages[c]->~BitImage();
+                XA_FREE(keptImages[c]);
+            }
+            if (keptImagesRotated[c])
+            {
+                keptImagesRotated[c]->~BitImage();
+                XA_FREE(keptImagesRotated[c]);
             }
         }
         // Remove padding from outer edges.
@@ -3387,6 +3700,93 @@ private:
             }
         }
         return best_metric != INT_MAX;
+    }
+
+    // Square-ring search around the position that centres the chart on (tx, ty): the nearest
+    // feasible ring wins, and within a ring the most compact spot (same metric as the random
+    // search). Typically a handful of canBlit calls instead of the 4096 random samples.
+    bool findChartLocation_near(
+        const PackOptions& options,
+        const BitImage* atlasBitImage,
+        const BitImage* chartBitImage,
+        const BitImage* chartBitImageRotated,
+        int w,
+        int h,
+        float tx,
+        float ty,
+        int* best_x,
+        int* best_y,
+        int* best_w,
+        int* best_h,
+        int* best_r,
+        uint32_t maxResolution,
+        int limit)
+    {
+        const int step = max(1, (int)options.nearSearchStep);
+        const int maxRadius = (int)options.nearSearchRadius;
+        int attempts = 0;
+        for (int radius = 0; radius <= maxRadius; radius += step)
+        {
+            bool found = false;
+            int best_metric = INT_MAX;
+            const int rotations = options.rotateCharts ? 2 : 1;
+            for (int r = 0; r < rotations; r++)
+            {
+                int cw = (int)chartBitImage->width();
+                int ch = (int)chartBitImage->height();
+                if (r == 1)
+                    swap(cw, ch);
+                const int cx = (int)floorf(tx - (float)cw * 0.5f);
+                const int cy = (int)floorf(ty - (float)ch * 0.5f);
+                const BitImage& image = r == 1 ? *chartBitImageRotated : *chartBitImage;
+                auto tryPosition = [&](int x, int y)
+                {
+                    if (x < 0 || y < 0)
+                        return;
+                    if (maxResolution > 0 && (x > (int)maxResolution - cw || y > (int)maxResolution - ch))
+                        return;
+                    if (x + cw > limit || y + ch > limit)
+                        return;
+                    attempts++;
+                    const int area = max(w, x + cw) * max(h, y + ch);
+                    const int extents = max(max(w, x + cw), max(h, y + ch));
+                    const int metric = extents * extents + area;
+                    if (metric >= best_metric)
+                        return;
+                    if (! atlasBitImage->canBlit(image, (uint32_t)x, (uint32_t)y))
+                        return;
+                    best_metric = metric;
+                    *best_x = x;
+                    *best_y = y;
+                    *best_w = cw;
+                    *best_h = ch;
+                    *best_r = options.rotateCharts ? r : 0;
+                    found = true;
+                };
+                if (radius == 0)
+                {
+                    tryPosition(cx, cy);
+                }
+                else
+                {
+                    for (int d = -radius; d <= radius; d += step)
+                    {
+                        tryPosition(cx + d, cy - radius);
+                        tryPosition(cx + d, cy + radius);
+                    }
+                    for (int d = -radius + step; d <= radius - step; d += step)
+                    {
+                        tryPosition(cx - radius, cy + d);
+                        tryPosition(cx + radius, cy + d);
+                    }
+                }
+            }
+            if (found)
+                return true;
+            if (attempts > (int)options.nearSearchAttempts)
+                return false;
+        }
+        return false;
     }
 
     bool findChartLocation_random(
@@ -3573,6 +3973,8 @@ private:
     Array<float> m_utilization;
     Array<BitImage*> m_bitImages;
     Array<Chart*> m_charts;
+    Array<uint32_t> m_order, m_nbOffsets, m_nbIds, m_groups, m_blockSize; // layout hints (empty = none)
+    Array<float> m_nbWeights;
     RadixSort m_radix;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -3591,6 +3993,8 @@ struct Context
     internal::Array<internal::UvMesh*> uvMeshes;
     internal::Array<internal::UvMeshInstance*> uvMeshInstances;
     bool uvMeshChartsComputed = false;
+    internal::Array<uint32_t> hintOrder, hintNbOffsets, hintNbIds, hintGroups, hintBlockSize;
+    internal::Array<float> hintNbWeights;
 };
 
 Atlas* Create()
@@ -3763,6 +4167,39 @@ void SetCharts(Atlas* atlas, const std::vector<std::vector<size_t>>& grouped_fac
     ctx->uvMeshChartsComputed = true;
 }
 
+void SetChartLayoutHints(Atlas* atlas, const ChartLayoutHints& hints)
+{
+    if (! atlas)
+        return;
+    Context* ctx = (Context*)atlas;
+    ctx->hintOrder.clear();
+    ctx->hintNbOffsets.clear();
+    ctx->hintNbIds.clear();
+    ctx->hintNbWeights.clear();
+    ctx->hintGroups.clear();
+    ctx->hintBlockSize.clear();
+    if (! hints.order || hints.chartCount == 0)
+        return;
+    for (uint32_t i = 0; i < hints.chartCount; i++)
+        ctx->hintOrder.push_back(hints.order[i]);
+    if (hints.groupOfChart)
+        for (uint32_t i = 0; i < hints.chartCount; i++)
+            ctx->hintGroups.push_back(hints.groupOfChart[i]);
+    if (hints.groupBlockSize)
+        for (uint32_t i = 0; i < hints.chartCount; i++)
+            ctx->hintBlockSize.push_back(hints.groupBlockSize[i]);
+    if (hints.nbOffsets && hints.nbIds && hints.nbWeights)
+    {
+        for (uint32_t i = 0; i <= hints.chartCount; i++)
+            ctx->hintNbOffsets.push_back(hints.nbOffsets[i]);
+        for (uint32_t i = 0; i < hints.nbOffsets[hints.chartCount]; i++)
+        {
+            ctx->hintNbIds.push_back(hints.nbIds[i]);
+            ctx->hintNbWeights.push_back(hints.nbWeights[i]);
+        }
+    }
+}
+
 void PackCharts(Atlas* atlas, PackOptions packOptions)
 {
     // Validate arguments and context state.
@@ -3804,6 +4241,23 @@ void PackCharts(Atlas* atlas, PackOptions packOptions)
     internal::pack::Atlas packAtlas;
     for (uint32_t i = 0; i < ctx->uvMeshInstances.size(); i++)
         packAtlas.addUvMeshCharts(ctx->uvMeshInstances[i]);
+    if (! ctx->hintOrder.isEmpty())
+    {
+        ChartLayoutHints hints;
+        hints.order = ctx->hintOrder.data();
+        hints.chartCount = ctx->hintOrder.size();
+        if (! ctx->hintNbOffsets.isEmpty())
+        {
+            hints.nbOffsets = ctx->hintNbOffsets.data();
+            hints.nbIds = ctx->hintNbIds.data();
+            hints.nbWeights = ctx->hintNbWeights.data();
+        }
+        if (! ctx->hintGroups.isEmpty())
+            hints.groupOfChart = ctx->hintGroups.data();
+        if (! ctx->hintBlockSize.isEmpty())
+            hints.groupBlockSize = ctx->hintBlockSize.data();
+        packAtlas.setLayoutHints(hints);
+    }
     if (! packAtlas.packCharts(packOptions))
         return;
     // Populate atlas object with pack results.

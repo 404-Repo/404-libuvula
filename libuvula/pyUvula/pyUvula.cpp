@@ -4,6 +4,7 @@
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <spdlog/cfg/env.h>
 
 #include "Face.h"
 #include "Matrix44F.h"
@@ -15,8 +16,42 @@
 
 namespace py = pybind11;
 
-py::tuple pyUnwrap(const py::array_t<float>& vertices_array, const py::array_t<int32_t>& indices_array)
+py::tuple pyUnwrap(
+    const py::array_t<float>& vertices_array,
+    const py::array_t<int32_t>& indices_array,
+    const float cone_half_angle_deg,
+    const float absorb_half_angle_deg,
+    const int refine_iterations,
+    const int smoothing_passes,
+    const int min_island_faces,
+    const int min_island_texels,
+    const uint32_t pack_resolution,
+    const uint32_t texture_size,
+    const uint32_t padding,
+    const bool proximity_packing,
+    const uint32_t near_radius,
+    const uint32_t near_step,
+    const uint32_t near_attempts,
+    const uint32_t group_cell_texels,
+    const bool legacy_charting)
 {
+    const UnwrapOptions options{
+        .cone_half_angle_deg = cone_half_angle_deg,
+        .absorb_half_angle_deg = absorb_half_angle_deg,
+        .refine_iterations = refine_iterations,
+        .smoothing_passes = smoothing_passes,
+        .min_island_faces = min_island_faces,
+        .min_island_texels = min_island_texels,
+        .pack_resolution = pack_resolution,
+        .texture_size = texture_size,
+        .padding = padding,
+        .proximity_packing = proximity_packing,
+        .near_radius = near_radius,
+        .near_step = near_step,
+        .near_attempts = near_attempts,
+        .group_cell_texels = group_cell_texels,
+        .legacy_charting = legacy_charting,
+    };
     // input shaping
     const pybind11::buffer_info vertices_buf = vertices_array.request();
     const pybind11::buffer_info indices_buf = indices_array.request();
@@ -39,7 +74,7 @@ py::tuple pyUnwrap(const py::array_t<float>& vertices_array, const py::array_t<i
         py::gil_scoped_release release;
 
         // smartUnwrap may expand vertices/indices/uv_coords by duplicating boundary vertices
-        if (! smartUnwrap(vertices, indices, uv_coords, texture_width, texture_height, vertex_remap))
+        if (! smartUnwrap(vertices, indices, uv_coords, texture_width, texture_height, vertex_remap, options))
         {
             throw std::runtime_error("Couldn't unwrap UV's!");
         }
@@ -134,9 +169,32 @@ py::list pyProject(
 
 PYBIND11_MODULE(pyUvula, module)
 {
+    spdlog::cfg::load_env_levels(); // SPDLOG_LEVEL=debug for per-stage charting/packing logs
+
     module.doc() = "UV-unwrapping library (or bindings to library), segmentation uses a classic normal-based grouping and charts packing uses xatlas";
     module.attr("__version__") = PYUVULA_VERSION;
 
-    module.def("unwrap", &pyUnwrap, "Given the vertices, indices of a mesh, unwrap UV for texture-coordinates.");
+    module.def(
+        "unwrap",
+        &pyUnwrap,
+        "Given the vertices, indices of a mesh, unwrap UV for texture-coordinates. Returns (uvs, vertices, faces, texture_width, texture_height, vmap).",
+        py::arg("vertices"),
+        py::arg("indices"),
+        py::kw_only(),
+        py::arg("cone_half_angle_deg") = 40.0f,
+        py::arg("absorb_half_angle_deg") = 75.0f,
+        py::arg("refine_iterations") = 3,
+        py::arg("smoothing_passes") = 2,
+        py::arg("min_island_faces") = 3,
+        py::arg("min_island_texels") = 6,
+        py::arg("pack_resolution") = 1024u,
+        py::arg("texture_size") = 4096u,
+        py::arg("padding") = 0u,
+        py::arg("proximity_packing") = true,
+        py::arg("near_radius") = 96u,
+        py::arg("near_step") = 2u,
+        py::arg("near_attempts") = 2048u,
+        py::arg("group_cell_texels") = 0u,
+        py::arg("legacy_charting") = false);
     module.def("project", &pyProject, "Projects a stroke polygon into an object texture.");
 }
